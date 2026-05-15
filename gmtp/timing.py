@@ -77,8 +77,10 @@ def measure_timing(
                 _maybe_apply_chat_template(pair.tokenizer, prompts[0].text),
                 return_tensors="pt",
             ).to(device)
+            warm_attn = torch.ones_like(warm.input_ids, dtype=torch.long, device=warm.input_ids.device)
             _ = pair.target.generate(
                 warm.input_ids,
+                attention_mask=warm_attn,
                 max_new_tokens=8,
                 do_sample=False,
                 use_cache=True,
@@ -91,6 +93,7 @@ def measure_timing(
             text = _maybe_apply_chat_template(pair.tokenizer, p.text)
             enc = pair.tokenizer(text, return_tensors="pt").to(device)
             prompt_len = enc.input_ids.shape[1]
+            attention_mask = torch.ones_like(enc.input_ids, dtype=torch.long, device=enc.input_ids.device)
 
             cc.reset()
             if torch.cuda.is_available():
@@ -98,11 +101,11 @@ def measure_timing(
             t0 = time.perf_counter()
             out = pair.target.generate(
                 enc.input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=n_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else 1.0,
                 top_p=0.95 if do_sample else 1.0,
-                top_k=64 if do_sample else 0,
                 use_cache=True,
                 pad_token_id=pad_id,
                 assistant_model=pair.assistant,

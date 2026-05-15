@@ -5,7 +5,17 @@ description = "E0: instrumented baseline for Gemma 4 MTP drafter — cluster rec
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4",
-    "transformers>=4.57",
+    "transformers @ git+https://github.com/huggingface/transformers.git",
+    "triton<=3.1.0",
+    "einops>=0.8",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "tensorboard>=2.16",
+    "datasets>=2.14",
+    "accelerate>=0.30",
+    "tqdm>=4.64",
+    "peft>=0.9",
+    "torch>=2.4",
     "accelerate",
     "datasets",
     "huggingface-hub",

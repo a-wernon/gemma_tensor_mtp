@@ -3,9 +3,10 @@
 For each prompt:
   1. Generate a ground-truth continuation X of length N with the target
      (greedy or sampled).
-  2. For each position i in X, run the assistant on (prompt + X[:i]) so
-     the masked-embedder pre-hook captures the per-position cluster mask
-     for the *first draft step*. Recall_i = 1[X[i] in candidate set].
+  2. For each position i in X, run a single-step
+     target.generate(..., assistant_model=assistant) on (prompt + X[:i]) so
+     the masked-embedder pre-hook captures the cluster mask for the *first
+     draft step*. Recall_i = 1[X[i] in candidate set].
 
 This isolates the "is the target-preferred token in the assistant's
 top-k cluster mask" diagnostic, with no spec-decoding feedback loop.
@@ -16,15 +17,9 @@ no longer has the latest target hidden state — so first-draft recall is
 an upper bound on per-step recall in actual spec decoding. If even
 first-draft recall is high, downstream positions only get harder.
 
-FIRST-RUN GOTCHA — the isolated assistant call. The Gemma 4 assistant
-documented usage is target.generate(..., assistant_model=assistant); HF
-internally feeds it target hidden states + KV cache. We assume the
-assistant also accepts a bare pair.assistant(input_ids=...) call — if
-that errors (cross-attn requires target activations), the fix is to
-instead capture cluster events DURING a target.generate(...,
-assistant_model=...) run and align them to verified positions. That is
-strictly more invasive; we ship the simple path first and revise if it
-breaks.
+Note: Gemma 4 assistant cannot be called in isolation; it requires target
+hidden states + shared KV state. Candidate-set capture is therefore done
+inside `target.generate(..., assistant_model=...)`.
 """
 
 from __future__ import annotations
@@ -73,13 +68,14 @@ def _generate_continuation(
     temperature: float,
 ) -> torch.Tensor:
     """Plain target-only generation. Returns the new tokens [n_new]."""
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
     out = pair.target.generate(
         input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=n_new,
         do_sample=do_sample,
         temperature=temperature if do_sample else 1.0,
         top_p=1.0 if not do_sample else 0.95,
-        top_k=0 if not do_sample else 64,
         use_cache=True,
         pad_token_id=pair.tokenizer.eos_token_id,
     )
@@ -93,29 +89,35 @@ def _candidate_token_set_at_first_draft(
     cap: ClusterCapture,
     full_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the assistant once on `full_ids` (= prompt + revealed prefix) and
-    return the set of candidate token ids at the LAST position — this
-    matches "what would the assistant propose as draft token #1 given
-    this prefix".
+    """Run one assisted-decoding step on `full_ids` (= prompt + revealed
+    prefix) and return candidate ids at the last position.
 
     Returns: long tensor of unique candidate token ids.
     """
     cap.clear()
-    _ = pair.assistant(input_ids=full_ids, use_cache=False)
+    attention_mask = torch.ones_like(full_ids, dtype=torch.long, device=full_ids.device)
+    _ = pair.target.generate(
+        full_ids,
+        attention_mask=attention_mask,
+        # Force speculative path so the assistant is actually invoked.
+        max_new_tokens=8,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=pair.tokenizer.eos_token_id,
+        assistant_model=pair.assistant,
+        num_assistant_tokens=8,
+        assistant_confidence_threshold=0.0,
+    )
     if not cap.events:
         raise RuntimeError(
             "Cluster-capture pre-hook produced no events on the assistant "
             "forward. Either the masked embedder was not invoked, or the "
             "discovery picked the wrong submodule. See gmtp/gemma_io.py."
         )
-    # Concatenate candidate ids across all masked-embedder calls in this
-    # forward (most assistants invoke it once at the LM-head; if it fires
-    # per-layer we union them).
-    candidates: list[torch.Tensor] = []
-    for i in range(len(cap.events)):
-        c = cap.candidate_token_ids(i)   # [B, L, top_k * tpc]
-        candidates.append(c[0, -1])
-    return torch.unique(torch.cat(candidates))
+    # Use the first masked-embedder event, which corresponds to the first
+    # speculative draft step for this prefix.
+    c = cap.candidate_token_ids(0)  # [B, L, top_k * tpc]
+    return torch.unique(c[0, -1])
 
 
 def measure_recall(

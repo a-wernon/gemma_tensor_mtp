@@ -58,17 +58,13 @@ def load_pair(
     device: str,
 ) -> GemmaPair:
     logger.info(f"Loading target: {target_id}")
-    target = AutoModelForCausalLM.from_pretrained(
-        target_id, dtype=dtype, device_map=device
-    ).eval()
+    target = _load_model(target_id, dtype=dtype, device=device).eval()
     logger.info(f"Loading assistant: {assistant_id}")
-    assistant = AutoModelForCausalLM.from_pretrained(
-        assistant_id, dtype=dtype, device_map=device
-    ).eval()
+    assistant = _load_model(assistant_id, dtype=dtype, device=device).eval()
     tokenizer = AutoTokenizer.from_pretrained(target_id)
 
     masked = find_masked_embedder(assistant)
-    num_centroids = int(masked.centroids.shape[0])
+    num_centroids = _num_centroids(masked)
     token_ordering = _get_token_ordering(masked)
     tokens_per_centroid = int(token_ordering.shape[1])
     vocab_size = num_centroids * tokens_per_centroid
@@ -90,8 +86,8 @@ def load_pair(
         centroid_top_k=int(centroid_top_k),
         tokens_per_centroid=tokens_per_centroid,
         vocab_size=int(getattr(target.config, "vocab_size", vocab_size)),
-        hidden_size_target=int(target.config.hidden_size),
-        hidden_size_assistant=int(assistant.config.hidden_size),
+        hidden_size_target=_hidden_size_from_config(target.config),
+        hidden_size_assistant=_hidden_size_from_config(assistant.config),
     )
     logger.info(
         f"Pair ready. target_d={pair.hidden_size_target} "
@@ -100,6 +96,38 @@ def load_pair(
         f"tokens_per_centroid={pair.tokens_per_centroid}"
     )
     return pair
+
+
+def _load_model(model_id: str, dtype: torch.dtype, device: str) -> nn.Module:
+    """Load Gemma-family checkpoints across HF auto classes.
+
+    Newer Gemma 4 checkpoints may require image-text auto classes even for
+    text-only prompting. We first try CausalLM (best for assistant decoding),
+    then fall back to ImageTextToText.
+    """
+    kwargs = {
+        "dtype": dtype,
+        "device_map": device,
+        "attn_implementation": "sdpa",
+    }
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except Exception as e_causal:
+        logger.warning(
+            f"CausalLM load failed for {model_id}; trying ImageTextToText. "
+            f"Cause: {type(e_causal).__name__}: {e_causal}"
+        )
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
+        except Exception as e_vlm:
+            raise RuntimeError(
+                "Unable to load model with either AutoModelForCausalLM or "
+                "AutoModelForImageTextToText. This usually means the installed "
+                "transformers version is too old for Gemma 4. "
+                "Try: `uv pip install --upgrade transformers`."
+            ) from e_vlm
 
 
 def find_masked_embedder(model: nn.Module) -> nn.Module:
@@ -147,9 +175,46 @@ def _get_token_ordering(masked: nn.Module) -> torch.Tensor:
         raise RuntimeError("masked embedder has no token_ordering buffer")
     if t.dim() == 1:
         # Flat [V] permutation; reshape to [num_centroids, tokens_per_centroid].
-        n_c = int(masked.centroids.shape[0])
+        n_c = _num_centroids(masked)
         t = t.view(n_c, -1)
     return t
+
+
+def _centroid_weight_and_bias(masked: nn.Module) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return centroid projection weight [num_centroids, d] and optional bias.
+
+    On older layouts `masked.centroids` can be a Tensor. On current Gemma 4
+    assistant builds it is typically an `nn.Linear`.
+    """
+    c = getattr(masked, "centroids", None)
+    if c is None:
+        raise RuntimeError("masked embedder has no `centroids` attribute")
+    if torch.is_tensor(c):
+        return c, None
+    if isinstance(c, nn.Linear):
+        return c.weight, c.bias
+    if hasattr(c, "weight") and torch.is_tensor(c.weight):
+        b = c.bias if hasattr(c, "bias") and torch.is_tensor(c.bias) else None
+        return c.weight, b
+    raise RuntimeError(
+        f"Unsupported `centroids` type on masked embedder: {type(c).__name__}"
+    )
+
+
+def _num_centroids(masked: nn.Module) -> int:
+    w, _ = _centroid_weight_and_bias(masked)
+    return int(w.shape[0])
+
+
+def _hidden_size_from_config(cfg) -> int:
+    if hasattr(cfg, "hidden_size") and getattr(cfg, "hidden_size") is not None:
+        return int(cfg.hidden_size)
+    text_cfg = getattr(cfg, "text_config", None)
+    if text_cfg is not None and hasattr(text_cfg, "hidden_size"):
+        return int(text_cfg.hidden_size)
+    raise RuntimeError(
+        f"Unable to infer hidden size from config type {type(cfg).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +259,7 @@ def install_cluster_capture(masked: nn.Module) -> ClusterCapture:
     the embedder's internal tensor names, only its public `centroids`
     attribute and the captured input.
     """
-    centroids = masked.centroids
+    centroids, centroids_bias = _centroid_weight_and_bias(masked)
     token_ordering = _get_token_ordering(masked)
     top_k = int(
         getattr(masked, "centroid_top_k", None)
@@ -217,6 +282,8 @@ def install_cluster_capture(masked: nn.Module) -> ClusterCapture:
         # h: [B, L, d_assist]. Compute centroid logits and top-k indices.
         with torch.no_grad():
             scores = torch.matmul(h.float(), centroids.float().T)  # [B, L, num_c]
+            if centroids_bias is not None:
+                scores = scores + centroids_bias.float().view(1, 1, -1)
             top = scores.topk(top_k, dim=-1).indices            # [B, L, top_k]
         cap.events.append(top.detach().cpu())
 
