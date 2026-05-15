@@ -1,0 +1,26 @@
+[project]
+name = "gemma-mtp"
+version = "0.1.0"
+description = "E0: instrumented baseline for Gemma 4 MTP drafter — cluster recall + end-to-end timing."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.57",
+    "accelerate",
+    "datasets",
+    "huggingface-hub",
+    "tensorboard",
+    "matplotlib",
+    "numpy",
+    "tqdm",
+    "rich",
+    "loguru",
+    "pyyaml",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gmtp*"]
