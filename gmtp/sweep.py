@@ -54,7 +54,17 @@ class TopKMaxClusterCapture:
     _handle: Optional[object] = None
 
     def install(self) -> None:
-        centroids = self.masked.centroids
+        # centroids may be a raw Tensor or an nn.Linear — unwrap to weight tensor
+        c = self.masked.centroids
+        if isinstance(c, nn.Linear):
+            centroid_w = c.weight          # [num_c, d]
+            centroid_b = c.bias            # [num_c] or None
+        elif torch.is_tensor(c):
+            centroid_w = c
+            centroid_b = None
+        else:
+            centroid_w = c.weight
+            centroid_b = getattr(c, "bias", None)
         K_max = self.K_max
 
         def hook(_module, args, kwargs):
@@ -65,8 +75,10 @@ class TopKMaxClusterCapture:
             if h is None or not torch.is_tensor(h):
                 return
             with torch.no_grad():
-                scores = torch.matmul(h.float(), centroids.float().T)  # [B, L, num_c]
-                top = scores.topk(K_max, dim=-1).indices               # [B, L, K_max]
+                scores = torch.matmul(h.float(), centroid_w.float().T)  # [B, L, num_c]
+                if centroid_b is not None:
+                    scores = scores + centroid_b.float().view(1, 1, -1)
+                top = scores.topk(K_max, dim=-1).indices                # [B, L, K_max]
             self.events.append(top.detach().cpu())
 
         self._handle = self.masked.register_forward_pre_hook(hook, with_kwargs=True)
@@ -142,7 +154,23 @@ def measure_recall_topkmax(
             for i in range(new.shape[0]):
                 full_ids = torch.cat([enc.input_ids, new[:i].unsqueeze(0)], dim=1)
                 cap.clear()
-                _ = pair.assistant(input_ids=full_ids, use_cache=False)
+                # Gemma4AssistantModel requires inputs_embeds (target token embeds
+                # concatenated with target last hidden states) and shared_kv_states
+                # from the target forward — it cannot run standalone from input_ids.
+                target_out = pair.target(
+                    input_ids=full_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_shared_kv_states=True,
+                )
+                token_embeds = pair.target.get_input_embeddings()(full_ids)
+                last_hidden = target_out.hidden_states[-1]
+                inputs_embeds = torch.cat([token_embeds, last_hidden], dim=-1)
+                _ = pair.assistant(
+                    inputs_embeds=inputs_embeds,
+                    shared_kv_states=target_out.shared_kv_states,
+                    use_cache=False,
+                )
                 if not cap.events:
                     raise RuntimeError(
                         "TopKMaxClusterCapture: no events fired on assistant forward."
