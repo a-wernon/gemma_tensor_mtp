@@ -1,0 +1,52 @@
+run_name: g1_gemma4_e2b_cluster_factorisation
+
+target: google/gemma-4-E2B-it
+device: cuda
+dtype: bfloat16
+seed: 42
+
+data:
+  dataset: allenai/tulu-3-sft-mixture
+  split: train
+  max_examples: 10000          # G1 starter slice; scale up if GO
+  max_seq_len: 512             # CP-r=32 intermediate is [B,L,n,r,V]; 512 keeps
+                                # the activation under ~2 GB at batch=2
+  n_future: 8                  # MTPC window size for G1
+  chat_template: true
+  val_fraction: 0.02            # holdout for joint NLL
+
+loader:
+  batch_size: 2                 # raise once OOM headroom is confirmed
+  num_workers: 2
+  pin_memory: true
+
+heads:
+  # Both heads trained from scratch on identical (h_t, cluster_label) pairs.
+  # Honest comparison per Qwen3 NO-GO lesson.
+  - name: ff
+    kwargs: {}
+  - name: cp
+    kwargs:
+      rank: 32
+      parameterisation: shared_trunk
+      trunk_dim: 256
+
+train:
+  epochs: 1
+  lr: 3.0e-4
+  weight_decay: 0.0
+  gamma: 0.9                     # MTPC exponential discount
+  log_every: 50
+  eval_max_batches: null         # null = full val
+
+output:
+  root: runs/g1
+  tensorboard: true
+
+# Decision gate (per phase_g_cluster_mtpc.txt §G1):
+# If CP joint_nll gain over FF < 2% at n=8 → STOP. Joint cluster
+# structure does not exist meaningfully above rank-1.
+decision:
+  ff_head_name: ff
+  cp_head_name: cp
+  min_relative_gain: 0.02         # 2%

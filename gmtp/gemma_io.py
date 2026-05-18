@@ -1,40 +1,46 @@
-"""Gemma 4 target + assistant loading, plus masked-embedder hook for cluster-mask capture.
+"""Gemma 4 target + assistant loading and centroid-system access.
 
-API ASSUMPTIONS (verify on first run; adjust if class names differ on the
-installed transformers):
+For Phase G (cluster-MTPC), we only NEED the target — the head is bolted
+on the target's hidden states directly. The assistant is preserved as
+an *operational baseline* for G2 (compare our head's μ_acc against the
+released drafter's). To use the assistant outside HF's generate(), it
+must be called with target activations and shared_kv_states — that
+recipe is documented in `invoke_assistant_with_target_conditioning`.
 
-  * `AutoModelForCausalLM.from_pretrained(target_id)` returns a Gemma 4
-    causal LM. `target.config` has `hidden_size`, `vocab_size`.
-  * `AutoModelForCausalLM.from_pretrained(assistant_id)` returns the
-    assistant. The assistant exposes a sparse LM head as a submodule named
-    something like `masked_embedder` / `masked_embedding` — we discover it
-    by walking modules and matching on class name containing "Masked"
-    AND attribute presence (`centroids` and `token_ordering`).
-  * The masked embedder, given hidden state `h: [B, L, d]`, internally:
-      1. Computes centroid logits  C @ h.T          [B, L, num_centroids]
-      2. Selects top-`centroid_intermediate_top_k`  [B, L, top_k]
-      3. Gathers candidate token ids via `token_ordering`
-      4. Computes exact logits inside the candidate set
-      5. Scatters into a full [B, L, vocab_size] tensor (unselected = mask
-         value, per gemma_idea.txt §6).
-  * We install a forward-hook on the masked embedder that records, for
-    each call, the per-position selected centroid ids. The corresponding
-    candidate token ids are reconstructed via `token_ordering`.
-
-If the discovery fails (no module matches), `find_masked_embedder` raises
-with a clear message listing top-level submodule class names, so the user
-can patch the matcher quickly.
+What this module exposes:
+  load_target(...)                      — frozen Gemma 4 target only
+  load_pair(...)                        — target + assistant + tokenizer
+  find_masked_embedder(model)           — discover the sparse LM head
+  get_token_ordering(masked)            — [num_centroids, tokens_per_centroid]
+  get_centroid_weight_and_bias(masked)  — [num_centroids, d_assist] (+ bias)
+  install_call_counters(target, assist) — forward-call counters (G2)
+  invoke_assistant_with_target_conditioning(pair, full_ids)
+                                        — single-step assistant invocation
+                                          for offline analysis
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from loguru import logger
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GemmaTarget:
+    model: nn.Module
+    tokenizer: object
+    vocab_size: int
+    hidden_size: int
 
 
 @dataclass
@@ -51,12 +57,46 @@ class GemmaPair:
     hidden_size_assistant: int
 
 
+def _load_model(model_id: str, dtype: torch.dtype, device: str) -> nn.Module:
+    """Load Gemma-family checkpoints across HF auto classes.
+
+    Newer Gemma 4 checkpoints may register under ImageTextToText auto class
+    even for text-only prompting. Try CausalLM first, then fall back.
+    """
+    kwargs = {
+        "dtype": dtype,
+        "device_map": device,
+        "attn_implementation": "sdpa",
+    }
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except Exception as e_causal:
+        logger.warning(
+            f"CausalLM load failed for {model_id}; trying ImageTextToText. "
+            f"Cause: {type(e_causal).__name__}: {e_causal}"
+        )
+        from transformers import AutoModelForImageTextToText
+        return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
+
+
+def load_target(target_id: str, dtype: torch.dtype, device: str) -> GemmaTarget:
+    """Load only the target. Sufficient for G1 head-only training."""
+    logger.info(f"Loading target: {target_id}")
+    model = _load_model(target_id, dtype=dtype, device=device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(target_id)
+    H = _hidden_size_from_config(model.config)
+    V = int(getattr(model.config, "vocab_size", 0))
+    logger.info(f"Target loaded: hidden_size={H} vocab_size={V}")
+    return GemmaTarget(model=model, tokenizer=tokenizer, vocab_size=V, hidden_size=H)
+
+
 def load_pair(
     target_id: str,
     assistant_id: str,
     dtype: torch.dtype,
     device: str,
 ) -> GemmaPair:
+    """Load target + assistant (for G2+ operational baseline comparison)."""
     logger.info(f"Loading target: {target_id}")
     target = _load_model(target_id, dtype=dtype, device=device).eval()
     logger.info(f"Loading assistant: {assistant_id}")
@@ -65,7 +105,7 @@ def load_pair(
 
     masked = find_masked_embedder(assistant)
     num_centroids = _num_centroids(masked)
-    token_ordering = _get_token_ordering(masked)
+    token_ordering = get_token_ordering(masked)
     tokens_per_centroid = int(token_ordering.shape[1])
     vocab_size = num_centroids * tokens_per_centroid
 
@@ -98,46 +138,13 @@ def load_pair(
     return pair
 
 
-def _load_model(model_id: str, dtype: torch.dtype, device: str) -> nn.Module:
-    """Load Gemma-family checkpoints across HF auto classes.
-
-    Newer Gemma 4 checkpoints may require image-text auto classes even for
-    text-only prompting. We first try CausalLM (best for assistant decoding),
-    then fall back to ImageTextToText.
-    """
-    kwargs = {
-        "dtype": dtype,
-        "device_map": device,
-        "attn_implementation": "sdpa",
-    }
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-    except Exception as e_causal:
-        logger.warning(
-            f"CausalLM load failed for {model_id}; trying ImageTextToText. "
-            f"Cause: {type(e_causal).__name__}: {e_causal}"
-        )
-        try:
-            from transformers import AutoModelForImageTextToText
-
-            return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
-        except Exception as e_vlm:
-            raise RuntimeError(
-                "Unable to load model with either AutoModelForCausalLM or "
-                "AutoModelForImageTextToText. This usually means the installed "
-                "transformers version is too old for Gemma 4. "
-                "Try: `uv pip install --upgrade transformers`."
-            ) from e_vlm
+# ---------------------------------------------------------------------------
+# Centroid-system discovery
+# ---------------------------------------------------------------------------
 
 
 def find_masked_embedder(model: nn.Module) -> nn.Module:
-    """Locate the assistant's sparse / centroid-masked LM head.
-
-    Strategy: walk all submodules; pick the first whose class name contains
-    "Masked" and which exposes both `centroids` and a token_ordering buffer
-    (`token_ordering` or `ordered_token_ids`). Fall back to attribute-only
-    match if the class-name heuristic misses.
-    """
+    """Locate the assistant's sparse centroid-masked LM head."""
     candidates: list[tuple[str, nn.Module]] = []
     for name, mod in model.named_modules():
         cls = type(mod).__name__
@@ -160,13 +167,12 @@ def find_masked_embedder(model: nn.Module) -> nn.Module:
     sample = sorted({type(m).__name__ for m in model.modules()})[:30]
     raise RuntimeError(
         "Could not find a masked-embedder submodule on the assistant. "
-        f"Top-level class names sampled: {sample}. "
-        "Patch find_masked_embedder() in gmtp/gemma_io.py to match the "
-        "actual class / attribute names."
+        f"Top-level class names sampled: {sample}."
     )
 
 
-def _get_token_ordering(masked: nn.Module) -> torch.Tensor:
+def get_token_ordering(masked: nn.Module) -> torch.Tensor:
+    """Return [num_centroids, tokens_per_centroid] long tensor."""
     if hasattr(masked, "token_ordering"):
         t = masked.token_ordering
     elif hasattr(masked, "ordered_token_ids"):
@@ -174,17 +180,18 @@ def _get_token_ordering(masked: nn.Module) -> torch.Tensor:
     else:
         raise RuntimeError("masked embedder has no token_ordering buffer")
     if t.dim() == 1:
-        # Flat [V] permutation; reshape to [num_centroids, tokens_per_centroid].
         n_c = _num_centroids(masked)
         t = t.view(n_c, -1)
     return t
 
 
-def _centroid_weight_and_bias(masked: nn.Module) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+def get_centroid_weight_and_bias(
+    masked: nn.Module,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Return centroid projection weight [num_centroids, d] and optional bias.
 
-    On older layouts `masked.centroids` can be a Tensor. On current Gemma 4
-    assistant builds it is typically an `nn.Linear`.
+    `masked.centroids` may be a raw Tensor or an nn.Linear depending on
+    transformers version.
     """
     c = getattr(masked, "centroids", None)
     if c is None:
@@ -196,13 +203,11 @@ def _centroid_weight_and_bias(masked: nn.Module) -> tuple[torch.Tensor, Optional
     if hasattr(c, "weight") and torch.is_tensor(c.weight):
         b = c.bias if hasattr(c, "bias") and torch.is_tensor(c.bias) else None
         return c.weight, b
-    raise RuntimeError(
-        f"Unsupported `centroids` type on masked embedder: {type(c).__name__}"
-    )
+    raise RuntimeError(f"Unsupported `centroids` type: {type(c).__name__}")
 
 
 def _num_centroids(masked: nn.Module) -> int:
-    w, _ = _centroid_weight_and_bias(masked)
+    w, _ = get_centroid_weight_and_bias(masked)
     return int(w.shape[0])
 
 
@@ -212,97 +217,11 @@ def _hidden_size_from_config(cfg) -> int:
     text_cfg = getattr(cfg, "text_config", None)
     if text_cfg is not None and hasattr(text_cfg, "hidden_size"):
         return int(text_cfg.hidden_size)
-    raise RuntimeError(
-        f"Unable to infer hidden size from config type {type(cfg).__name__}"
-    )
+    raise RuntimeError(f"Unable to infer hidden size from config {type(cfg).__name__}")
 
 
 # ---------------------------------------------------------------------------
-# Cluster-mask capture
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ClusterCapture:
-    """Records, per masked-embedder call, the selected centroid ids.
-
-    `events` is a list of [B, L, top_k] long tensors on CPU. `clear()`
-    resets between prompts.
-    """
-
-    centroids: torch.Tensor                      # [num_centroids, d_assist]
-    token_ordering: torch.Tensor                 # [num_centroids, tokens_per_centroid]
-    centroid_top_k: int
-    events: list[torch.Tensor] = field(default_factory=list)
-    _handle: Optional[object] = None
-
-    def clear(self) -> None:
-        self.events.clear()
-
-    def candidate_token_ids(self, event_idx: int) -> torch.Tensor:
-        """Materialize the per-position candidate token id set for one event.
-
-        Returns: [B, L, top_k * tokens_per_centroid] long tensor on the same
-        device as token_ordering.
-        """
-        cluster_ids = self.events[event_idx].to(self.token_ordering.device)  # [B, L, top_k]
-        candidates = self.token_ordering[cluster_ids]  # [B, L, top_k, t_per_c]
-        B, L, k, tpc = candidates.shape
-        return candidates.reshape(B, L, k * tpc)
-
-
-def install_cluster_capture(masked: nn.Module) -> ClusterCapture:
-    """Install a forward pre-hook that captures top-k centroid ids per call.
-
-    The pre-hook re-computes centroid logits from the input hidden state
-    (cheap: 256 × 2048 matmul) and stores top-k indices. We do not rely on
-    the embedder's internal tensor names, only its public `centroids`
-    attribute and the captured input.
-    """
-    centroids, centroids_bias = _centroid_weight_and_bias(masked)
-    token_ordering = _get_token_ordering(masked)
-    top_k = int(
-        getattr(masked, "centroid_top_k", None)
-        or getattr(masked, "top_k", None)
-        or 32
-    )
-    cap = ClusterCapture(
-        centroids=centroids,
-        token_ordering=token_ordering,
-        centroid_top_k=top_k,
-    )
-
-    def pre_hook(_module, args, kwargs):
-        if args:
-            h = args[0]
-        else:
-            h = kwargs.get("hidden_states") or kwargs.get("input")
-        if h is None or not torch.is_tensor(h):
-            return
-        # h: [B, L, d_assist]. Compute centroid logits and top-k indices.
-        with torch.no_grad():
-            scores = torch.matmul(h.float(), centroids.float().T)  # [B, L, num_c]
-            if centroids_bias is not None:
-                scores = scores + centroids_bias.float().view(1, 1, -1)
-            top = scores.topk(top_k, dim=-1).indices            # [B, L, top_k]
-        cap.events.append(top.detach().cpu())
-
-    cap._handle = masked.register_forward_pre_hook(pre_hook, with_kwargs=True)
-    logger.info(
-        f"Installed cluster-capture pre-hook on masked embedder "
-        f"(top_k={top_k}, num_centroids={centroids.shape[0]})"
-    )
-    return cap
-
-
-def remove_capture(cap: ClusterCapture) -> None:
-    if cap._handle is not None:
-        cap._handle.remove()
-        cap._handle = None
-
-
-# ---------------------------------------------------------------------------
-# Forward-call counters
+# Forward-call counters (G2 operational baseline)
 # ---------------------------------------------------------------------------
 
 
@@ -338,3 +257,41 @@ def remove_counters(cc: CallCounter) -> None:
     if cc._a_handle is not None:
         cc._a_handle.remove()
     cc._t_handle = cc._a_handle = None
+
+
+# ---------------------------------------------------------------------------
+# Assistant invocation with target conditioning
+# (For G2 operational-baseline analysis. Not used in G1.)
+# ---------------------------------------------------------------------------
+
+
+@torch.inference_mode()
+def invoke_assistant_with_target_conditioning(
+    pair: GemmaPair,
+    input_ids: torch.Tensor,
+) -> object:
+    """Single-step assistant forward with proper target conditioning.
+
+    The Gemma 4 assistant expects:
+      * inputs_embeds = concat(token_embeds(input_ids), target_last_hidden)
+        along the feature dim (not seq dim).
+      * shared_kv_states from a target forward with
+        `return_shared_kv_states=True`.
+    Standalone `assistant(input_ids=...)` is NOT supported.
+
+    Returns the assistant's forward output (logits over vocab).
+    """
+    target_out = pair.target(
+        input_ids=input_ids,
+        use_cache=False,
+        output_hidden_states=True,
+        return_shared_kv_states=True,
+    )
+    token_embeds = pair.target.get_input_embeddings()(input_ids)
+    last_hidden = target_out.hidden_states[-1]
+    inputs_embeds = torch.cat([token_embeds, last_hidden], dim=-1)
+    return pair.assistant(
+        inputs_embeds=inputs_embeds,
+        shared_kv_states=target_out.shared_kv_states,
+        use_cache=False,
+    )
